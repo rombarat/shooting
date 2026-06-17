@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { buildMap } from "./map.js";
 import * as Sfx from "./audio.js";
+import { createViewmodels } from "./viewmodels.js";
 
 // ===================== Renderer / scene =====================
 const canvas = document.getElementById("game");
@@ -124,15 +125,9 @@ function addOther(p) {
 function removeOther(id) { if (others[id]) { scene.remove(others[id].group); delete others[id]; } delete meta[id]; }
 
 // ===================== Weapon viewmodel =====================
-const gunGroup = new THREE.Group();
-const gunMesh = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.14, 0.7), new THREE.MeshStandardMaterial({ color: 0x1a1a1a }));
-gunMesh.position.set(0.25, -0.22, -0.5);
-const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.3), new THREE.MeshStandardMaterial({ color: 0x333 }));
-barrel.rotation.x = Math.PI / 2; barrel.position.set(0.25, -0.18, -0.9);
-const flash = new THREE.PointLight(0xffaa33, 0, 5); flash.position.set(0.25, -0.18, -1.1);
-gunGroup.add(gunMesh, barrel, flash);
-camera.add(gunGroup);
 scene.add(camera);
+const vm = createViewmodels(camera);
+const grenades = []; // live thrown-grenade projectiles { mesh, vel, t }
 
 // ===================== Bomb model =====================
 let bombMesh = null;
@@ -172,6 +167,7 @@ function refreshWeaponHud() {
   const w = curStats();
   if (!w) { weaponNameEl.textContent = ""; ammoEl.textContent = ""; return; }
   weaponNameEl.textContent = w.name;
+  if (vm) vm.setWeapon(curWeapon());
   const a = ammo[curWeapon()];
   if (w.slot === "melee") ammoEl.innerHTML = "🔪";
   else if (w.slot === "grenade") ammoEl.innerHTML = a && a.mag > 0 ? "💣 x1" : "—";
@@ -372,22 +368,25 @@ function tryShoot(t) {
   if (!me.alive || !pointerLocked || reloading || phase === "buy") return;
   const w = curStats(); if (!w) return;
   if (t - lastShot < w.fireRate) return;
+  // Each weapon type has its own action
   if (w.slot === "grenade") { throwGrenade(t); return; }
-  if (w.slot !== "melee") {
-    const a = ammo[curWeapon()];
-    if (!a || a.mag <= 0) { startReload(); return; }
-    a.mag--;
-  }
+  if (w.slot === "melee") { knifeAttack(t, w); return; }
+  gunFire(t, w);
+}
+
+// --- Hitscan guns: muzzle flash, recoil, tracer ---
+function gunFire(t, w) {
+  const a = ammo[curWeapon()];
+  if (!a || a.mag <= 0) { startReload(); return; }
+  a.mag--;
   lastShot = t;
   refreshWeaponHud();
-  flash.intensity = 3; setTimeout(() => (flash.intensity = 0), 45);
-  gunGroup.position.z = 0.06;
-  pitch += (w.spread || 0.01) * 0.5; // recoil kick
+  vm.recoil(w.slot === "primary" ? 1.1 : 0.8);
+  pitch += (w.spread || 0.01) * 0.5; // view recoil kick
   Sfx.playShot(curWeapon());
 
   const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
-  // apply spread
-  if (w.spread) { dir.x += (Math.random() - 0.5) * w.spread; dir.y += (Math.random() - 0.5) * w.spread; dir.normalize(); }
+  if (w.spread && !scoped) { dir.x += (Math.random() - 0.5) * w.spread; dir.y += (Math.random() - 0.5) * w.spread; dir.normalize(); }
   raycaster.set(camera.position.clone(), dir);
   raycaster.far = w.range;
 
@@ -403,19 +402,56 @@ function tryShoot(t) {
       hit();
     }
   }
-  const from = camera.position.clone().add(dir.clone().multiplyScalar(1.2)).add(new THREE.Vector3(0, -0.15, 0));
+  const from = vm.muzzleWorld(new THREE.Vector3());
   spawnTracer(from, end);
   socket.emit("shoot", { from: { x: from.x, y: from.y, z: from.z }, to: { x: end.x, y: end.y, z: end.z }, weapon: curWeapon() });
 }
 
+// --- Knife: melee swing, short range, no ammo, no tracer ---
+function knifeAttack(t, w) {
+  lastShot = t;
+  vm.swing();
+  Sfx.playShot("knife");
+  const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
+  raycaster.set(camera.position.clone(), dir);
+  raycaster.far = w.range;
+  const targets = [];
+  for (const id in others) if (others[id].group.visible) targets.push(others[id].body, others[id].head);
+  const hits = raycaster.intersectObjects(targets, false);
+  // small delay so the hit lands mid-swing
+  setTimeout(() => {
+    if (hits.length && hits[0].distance <= w.range) {
+      const ud = hits[0].object.userData;
+      if (ud && ud.playerId) {
+        socket.emit("hit", { targetId: ud.playerId, weapon: "knife", headshot: ud.part === "head" });
+        hit();
+      }
+    }
+  }, 120);
+}
+
+// --- Grenade: arced throw projectile (no hitscan) ---
 function throwGrenade(t) {
   const a = ammo.grenade; if (!a || a.mag <= 0) return;
   a.mag = 0; lastShot = t; refreshWeaponHud();
+  vm.throwGrenade();
   const dir = new THREE.Vector3(); camera.getWorldDirection(dir);
-  const land = camera.position.clone().add(dir.multiplyScalar(18));
+  // landing target along aim, capped to map
+  const land = camera.position.clone().add(dir.clone().multiplyScalar(20));
   land.y = 0.5; collide(land);
+  // spawn a visible arcing projectile for everyone (thrower sees real arc)
+  spawnGrenadeProjectile(camera.position.clone().add(dir.clone().multiplyScalar(0.6)), dir);
   socket.emit("grenade", { from: { x: camera.position.x, y: camera.position.y, z: camera.position.z }, x: land.x, z: land.z });
-  selectSlot(me.weapons.primary ? "primary" : "secondary");
+  // auto-switch back to a real weapon after throwing
+  setTimeout(() => selectSlot(me.weapons.primary ? "primary" : "secondary"), 200);
+}
+
+function spawnGrenadeProjectile(origin, dir) {
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.12, 12, 12), new THREE.MeshStandardMaterial({ color: 0x3b5323, roughness: 0.8 }));
+  mesh.position.copy(origin);
+  scene.add(mesh);
+  const vel = dir.clone().multiplyScalar(16); vel.y += 5; // throw arc
+  grenades.push({ mesh, vel, t: 0 });
 }
 
 function hit() { const h = $("hitmarker"); h.style.opacity = 1; Sfx.playHit(); setTimeout(() => (h.style.opacity = 0), 120); }
@@ -426,6 +462,7 @@ function startReload() {
   const a = ammo[curWeapon()];
   if (!a || a.mag === w.mag || a.reserve <= 0) return;
   reloading = true; weaponNameEl.textContent = w.name + " — reloading…";
+  vm.reload(w.reloadMs);
   Sfx.playReload();
   setTimeout(() => {
     const need = w.mag - a.mag, take = Math.min(need, a.reserve);
@@ -557,6 +594,7 @@ function startGame() {
 function loop(time) {
   requestAnimationFrame(loop);
   const dt = Math.min((time - lastTime) / 1000, 0.05); lastTime = time;
+  let moving = false;
 
   if (me.alive && phase !== "buy" && !buyOpen && !chatOpen) {
     const speed = keys["ShiftLeft"] ? WALK : RUN;
@@ -565,7 +603,7 @@ function loop(time) {
     const move = new THREE.Vector3();
     if (keys["KeyW"]) move.add(f); if (keys["KeyS"]) move.sub(f);
     if (keys["KeyD"]) move.add(r); if (keys["KeyA"]) move.sub(r);
-    const moving = move.lengthSq() > 0;
+    moving = move.lengthSq() > 0;
     if (moving) move.normalize().multiplyScalar(speed);
     vel.x = move.x; vel.z = move.z;
     if (keys["Space"] && onGround) { vel.y = JUMP_V; onGround = false; }
@@ -588,8 +626,18 @@ function loop(time) {
 
   camera.position.copy(pos);
   camera.rotation.set(0, 0, 0); camera.rotateY(yaw); camera.rotateX(pitch);
-  gunGroup.position.z += (0 - gunGroup.position.z) * 0.15;
-  gunGroup.visible = !scoped;
+  vm.update(dt, moving && onGround);
+  vm.setVisible(!scoped);
+
+  // grenade projectiles: gravity arc + bounce, fade after fuse
+  for (let i = grenades.length - 1; i >= 0; i--) {
+    const g = grenades[i]; g.t += dt;
+    g.vel.y -= 22 * dt;
+    g.mesh.position.addScaledVector(g.vel, dt);
+    if (g.mesh.position.y < 0.12) { g.mesh.position.y = 0.12; g.vel.y *= -0.4; g.vel.x *= 0.6; g.vel.z *= 0.6; }
+    g.mesh.rotation.x += dt * 6; g.mesh.rotation.y += dt * 4;
+    if (g.t > 1.7) { scene.remove(g.mesh); grenades.splice(i, 1); }
+  }
 
   for (const id in others) {
     const o = others[id];

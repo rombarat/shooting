@@ -30,6 +30,12 @@ A Counter-Strike-style multiplayer FPS in the browser: bomb-defusal rounds, an e
 
 Knife (סכין), Pistol (אקדח), M16, M4 Rifle (רובה), AK-47, AWP Sniper (רובה צלפים), HE Grenade (רימון). Stats live in [public/weapons.json](public/weapons.json) — tweak prices/damage freely. Headshots apply a per-weapon multiplier; the server validates ownership, range, and friendly fire.
 
+Each weapon has its **own 3D viewmodel, animation, and action** (see [public/viewmodels.js](public/viewmodels.js)):
+
+- **Guns** (pistol/M16/M4/AK/AWP) — distinct models, hitscan fire with muzzle flash, recoil kick, and tracers. The AWP has a scope (right-click).
+- **Knife** — a melee blade with a swing animation, short range, no ammo, no tracer. It only hits enemies close in front of you.
+- **Grenade** — a thrown projectile that arcs with gravity and bounces; it is NOT hitscan. It explodes after a fuse and deals splash damage server-side.
+
 ## Run locally
 
 ```
